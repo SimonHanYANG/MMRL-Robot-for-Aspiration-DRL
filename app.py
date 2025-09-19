@@ -468,7 +468,7 @@ class StageThread(QThread):
             # Get new Z position
             new_z = self.stage.get_z_position()
             
-            self.status_signal.emit(f"Z moved from {current_z:.2f} to {new_z:.2f} (Δz: {z_delta})", "info")
+            self.status_signal.emit(f"Z moved from {current_z:.2f} to {new_z:.2f} (Δz: {z_delta}) μm", "info")
             
         except Exception as e:
             self.logger.error(f"Z move error: {e}")
@@ -765,7 +765,7 @@ class ArmThread(QThread):
             
             if success:
                 self.position_signal.emit(x_steps, y_steps, z_steps)
-                self.status_signal.emit(f"Arm {self.arm_id} position: X:{x_steps}, Y:{y_steps}, Z:{z_steps}", "info")
+                self.status_signal.emit(f"Arm {self.arm_id} position: X:{x_steps}, Y:{y_steps}, Z:{z_steps} μm", "info")
             else:
                 self.status_signal.emit(f"Failed to get Arm {self.arm_id} position", "error")
                 
@@ -776,7 +776,20 @@ class ArmThread(QThread):
     def move_motor(self, motor_type, speed, step):
         """Move arm motor"""
         try:
-            success, result_data = armMovebyPos(self.arm_id, motor_type, speed, step)
+            success, x, y, z = armGetMotorPos(self.arm_id)
+            if success:
+                self.current_x = x
+                self.current_y = y
+                self.current_z = z
+            target_pos = 0
+            #print("speed is = ", speed, "step is = ", step)
+            if motor_type == 1:
+                target_pos = x - step
+            elif motor_type == 2:
+                target_pos = y + step
+            elif motor_type == 3:
+                target_pos = z + step
+            success, result = armMovebyPos(self.arm_id, motor_type, speed, target_pos)
             
             if success:
                 motor_names = {1: "X", 2: "Y", 3: "Z"}
@@ -1096,16 +1109,16 @@ class MainWindow(QMainWindow):
         # Movement distance setting
         distance_layout = QFormLayout()
         self.arm_distance_spin = QSpinBox()
-        self.arm_distance_spin.setRange(1, 10000)
+        self.arm_distance_spin.setRange(-10000, 10000)
         self.arm_distance_spin.setValue(100)
-        self.arm_distance_spin.setSuffix(" steps")
+        self.arm_distance_spin.setSuffix(" μm")
         distance_layout.addRow("Move Distance:", self.arm_distance_spin)
         
         # Movement speed setting
         self.arm_speed_spin = QSpinBox()
-        self.arm_speed_spin.setRange(1, 100)
-        self.arm_speed_spin.setValue(10)
-        self.arm_speed_spin.setSuffix(" units/s")
+        self.arm_speed_spin.setRange(1, 10000)
+        self.arm_speed_spin.setValue(100)
+        self.arm_speed_spin.setSuffix(" μm/s")
         distance_layout.addRow("Move Speed:", self.arm_speed_spin)
         
         arm_layout.addLayout(distance_layout)
@@ -1164,7 +1177,7 @@ class MainWindow(QMainWindow):
         step_layout = QFormLayout()
         self.pump_step_spin = QSpinBox()
         self.pump_step_spin.setRange(1, 50000)
-        self.pump_step_spin.setValue(10000)
+        self.pump_step_spin.setValue(1000)
         self.pump_step_spin.setSuffix(" steps")
         step_layout.addRow("Step Size:", self.pump_step_spin)
         
@@ -1389,7 +1402,7 @@ class MainWindow(QMainWindow):
     
     def update_pump_position(self, x, y, z):
         """Update pump position display"""
-        self.update_pump_status(f"Position - X:{x:.2f}, Y:{y:.2f}, Z:{z:.2f}", "info")
+        self.update_pump_status(f"Position - X:{x:.2f}, Y:{y:.2f}, Z:{z:.2f} μm", "info")
     
     def update_recording_status(self, message, msg_type="info"):
         """Update recording status label"""
