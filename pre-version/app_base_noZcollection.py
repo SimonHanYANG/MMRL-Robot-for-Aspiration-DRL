@@ -328,189 +328,6 @@ class CameraThread(QThread):
         self.wait(3000)  # Wait up to 3 seconds for safe shutdown
 
 
-class DepthDatasetThread(QThread):
-    """Thread for collecting Z-depth dataset"""
-    status_signal = pyqtSignal(str, str)  # message, type
-    collection_progress_signal = pyqtSignal(int, int)  # current, total
-    collection_complete_signal = pyqtSignal(bool, str)  # success, message
-    roi_marker_signal = pyqtSignal(QPoint)  # ROI center point for display
-    
-    def __init__(self):
-        super().__init__()
-        self.running = False
-        self.command_queue = queue.Queue()
-        self.stage = None
-        self.current_image = None
-        self.logger = logging.getLogger(__name__)
-        
-        # Create depth_dataset directory if it doesn't exist
-        os.makedirs("depth_dataset", exist_ok=True)
-        
-        # Z-axis parameters - ensure these are integers for directory naming
-        self.z_step = 100  # 50 μm per step (integer)
-        self.z_range = 500   # ±500 μm range (integer)
-        self.roi_size = 64  # 64x64 ROI (integer)
-        
-    def set_current_image(self, image):
-        """Update current image for ROI extraction"""
-        self.current_image = image.copy() if image is not None else None
-        
-    def run(self):
-        self.running = True
-        
-        try:
-            # Initialize stage
-            self.stage = Stage()
-            self.status_signal.emit("Depth dataset thread initialized", "info")
-            
-            while self.running:
-                try:
-                    # Get command from queue with timeout
-                    cmd, args = self.command_queue.get(timeout=0.5)
-                    
-                    if cmd == "collect_dataset":
-                        center_x, center_y = args
-                        self.collect_z_dataset(center_x, center_y)
-                    
-                    self.command_queue.task_done()
-                    
-                except queue.Empty:
-                    continue
-                    
-        except Exception as e:
-            error_msg = f"Depth dataset thread error: {str(e)}"
-            self.logger.error(error_msg)
-            self.status_signal.emit(error_msg, "error")
-        finally:
-            self._cleanup()
-    
-    def _cleanup(self):
-        """Clean up stage resources"""
-        try:
-            if hasattr(self, 'stage') and self.stage:
-                self.stage.close()
-                self.logger.info("Depth dataset stage closed")
-        except Exception as e:
-            self.logger.error(f"Depth dataset cleanup error: {e}")
-    
-    def collect_z_dataset(self, center_x, center_y):
-        """Collect Z-depth dataset centered at the given point"""
-        try:
-            # Emit ROI marker signal for display
-            self.roi_marker_signal.emit(QPoint(center_x, center_y))
-            
-            if self.current_image is None:
-                self.collection_complete_signal.emit(False, "No image available for ROI extraction")
-                return
-            
-            # Generate timestamp for image names
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            
-            # Get initial Z position
-            initial_z = self.stage.get_z_position()
-            self.status_signal.emit(f"Starting Z-depth collection at ({center_x}, {center_y})", "info")
-            
-            # Calculate the actual depth values to sample, using z_step
-            # Ensure we use integers for calculations
-            z_range_int = int(self.z_range)
-            z_step_int = int(self.z_step)
-            
-            num_steps = (2 * z_range_int) // z_step_int + 1
-            
-            # Generate depth values as integers
-            depth_values = []
-            for i in range(int(num_steps)):
-                depth = -z_range_int + i * z_step_int
-                depth_values.append(int(depth))
-            
-            # Create depth directories
-            for depth in depth_values:
-                depth_dir = os.path.join("depth_dataset", str(depth))
-                os.makedirs(depth_dir, exist_ok=True)
-            
-            total_images = len(depth_values)
-            
-            # Collect images at different depths
-            for i, depth in enumerate(depth_values):
-                # Update progress
-                self.collection_progress_signal.emit(i + 1, total_images)
-                
-                # Move to target Z position
-                target_z = initial_z + float(depth)  # Convert to float for stage movement
-                self.stage.move_z_to_absolute(target_z)
-                
-                # Wait for stage to settle
-                time.sleep(0.2)
-                
-                # Extract ROI from current image
-                roi = self._extract_roi(center_x, center_y)
-                
-                if roi is not None:
-                    # Save ROI image
-                    depth_dir = os.path.join("depth_dataset", str(depth))
-                    filename = os.path.join(depth_dir, f"{timestamp}.png")
-                    cv2.imwrite(filename, roi)
-                    
-                    self.status_signal.emit(f"Saved depth {depth} μm: {filename}", "info")
-                else:
-                    self.logger.warning(f"Failed to extract ROI for depth {depth}")
-            
-            # Return to initial Z position
-            self.stage.move_z_to_absolute(initial_z)
-            
-            self.collection_complete_signal.emit(True, f"Successfully collected {total_images} depth images")
-            
-        except Exception as e:
-            error_msg = f"Z-depth collection failed: {str(e)}"
-            self.logger.error(error_msg)
-            self.collection_complete_signal.emit(False, error_msg)
-            
-            # Try to return to initial position
-            try:
-                if 'initial_z' in locals():
-                    self.stage.move_z_to_absolute(initial_z)
-            except:
-                pass
-    
-    def _extract_roi(self, center_x, center_y):
-        """Extract 64x64 ROI centered at given coordinates"""
-        if self.current_image is None:
-            return None
-            
-        try:
-            h, w = self.current_image.shape[:2]
-            
-            # Calculate ROI bounds
-            half_size = self.roi_size // 2
-            
-            # Ensure ROI is within image bounds
-            x1 = max(0, center_x - half_size)
-            y1 = max(0, center_y - half_size)
-            x2 = min(w, center_x + half_size)
-            y2 = min(h, center_y + half_size)
-            
-            # Extract ROI
-            roi = self.current_image[y1:y2, x1:x2]
-            
-            # Ensure ROI is exactly 64x64
-            if roi.shape[0] != self.roi_size or roi.shape[1] != self.roi_size:
-                roi = cv2.resize(roi, (self.roi_size, self.roi_size))
-            
-            return roi
-            
-        except Exception as e:
-            self.logger.error(f"ROI extraction error: {e}")
-            return None
-    
-    def request_collect_dataset(self, center_x, center_y):
-        """Request to collect Z-depth dataset"""
-        self.command_queue.put(("collect_dataset", (center_x, center_y)))
-    
-    def stop(self):
-        self.running = False
-        self.wait(1000)
-
-
 class StageThread(QThread):
     """Thread for controlling stage movement and calibration"""
     status_signal = pyqtSignal(str, str)  # message, type (info, warning, error)
@@ -965,6 +782,7 @@ class ArmThread(QThread):
                 self.current_y = y
                 self.current_z = z
             target_pos = 0
+            #print("speed is = ", speed, "step is = ", step)
             if motor_type == 1:
                 target_pos = x - step
             elif motor_type == 2:
@@ -1152,25 +970,18 @@ class MainWindow(QMainWindow):
         # Reference point setting mode
         self.reference_point_mode = False
         
-        # Depth dataset collection mode
-        self.depth_collection_mode = False
-        
         # Visual feedback markers
         self.target_marker = None
         self.reference_marker = None
-        self.roi_marker = None
         self.marker_timer = QTimer()
         self.marker_timer.timeout.connect(self.clear_markers)
         
         # Z-axis movement step size
-        self.z_step = 50.0  # 5 μm per scroll step
+        self.z_step = 5.0  # 5 μm per scroll step
         
         # Recording state
         self.is_recording = False
         self.current_image_size = (1600, 1200)  # Default size
-        
-        # Current image for ROI extraction
-        self.current_image = None
         
         # Start threads
         self.start_threads()
@@ -1278,25 +1089,11 @@ class MainWindow(QMainWindow):
         self.set_ref_point_btn.clicked.connect(self.start_set_reference_point)
         stage_layout.addWidget(self.set_ref_point_btn)
         
-        # Collect Z Dataset button
-        self.collect_z_dataset_btn = QPushButton("Collect Z Dataset")
-        self.collect_z_dataset_btn.setFixedHeight(40)
-        self.collect_z_dataset_btn.setStyleSheet("background-color: #FFCC99; font-weight: bold;")
-        self.collect_z_dataset_btn.clicked.connect(self.start_collect_z_dataset)
-        stage_layout.addWidget(self.collect_z_dataset_btn)
-        
         # Z-axis control info
         z_info_label = QLabel("Use mouse wheel to control Z-axis: Scroll up to rise, down to fall.")
         z_info_label.setStyleSheet("color: #0066CC; font-style: italic;")
         z_info_label.setWordWrap(True)
         stage_layout.addWidget(z_info_label)
-        
-        # Dataset collection progress
-        self.dataset_progress_label = QLabel("")
-        self.dataset_progress_label.setStyleSheet("background-color: #E6F3FF; color: #0066CC; padding: 5px;")
-        self.dataset_progress_label.setWordWrap(True)
-        self.dataset_progress_label.hide()
-        stage_layout.addWidget(self.dataset_progress_label)
     
     def _setup_arm_control_group(self):
         """Setup arm control group"""
@@ -1437,12 +1234,10 @@ class MainWindow(QMainWindow):
         self.arm_thread = ArmThread(arm_id=1)  # Use arm ID 1
         self.pump_thread = PumpControlThread()
         self.video_recording_thread = VideoRecordingThread()
-        self.depth_dataset_thread = DepthDatasetThread()
         
         # Connect camera signals
         self.camera_thread.new_image_signal.connect(self.update_display)
         self.camera_thread.new_image_signal.connect(self.video_recording_thread.update_frame)
-        self.camera_thread.new_image_signal.connect(self.update_current_image)
         self.camera_thread.error_signal.connect(self.show_error)
         
         # Connect stage signals
@@ -1463,12 +1258,6 @@ class MainWindow(QMainWindow):
         self.video_recording_thread.status_signal.connect(self.update_recording_status)
         self.video_recording_thread.recording_started_signal.connect(self.on_recording_started)
         self.video_recording_thread.recording_stopped_signal.connect(self.on_recording_stopped)
-        
-        # Connect depth dataset signals
-        self.depth_dataset_thread.status_signal.connect(self.update_status)
-        self.depth_dataset_thread.collection_progress_signal.connect(self.update_dataset_progress)
-        self.depth_dataset_thread.collection_complete_signal.connect(self.on_dataset_collection_complete)
-        self.depth_dataset_thread.roi_marker_signal.connect(self.show_roi_marker)
     
     def start_threads(self):
         """Start all control threads"""
@@ -1477,13 +1266,6 @@ class MainWindow(QMainWindow):
         self.arm_thread.start()
         self.pump_thread.start()
         self.video_recording_thread.start()
-        self.depth_dataset_thread.start()
-    
-    def update_current_image(self, image):
-        """Update current image for depth dataset thread"""
-        self.current_image = image.copy() if image is not None else None
-        if self.depth_dataset_thread:
-            self.depth_dataset_thread.set_current_image(self.current_image)
     
     def update_display(self, image):
         """Update the display with camera image"""
@@ -1548,19 +1330,6 @@ class MainWindow(QMainWindow):
                                self.target_marker.x() + 15, self.target_marker.y())
                 painter.drawLine(self.target_marker.x(), self.target_marker.y() - 15,
                                self.target_marker.x(), self.target_marker.y() + 15)
-            
-            # Draw ROI marker (orange) for depth dataset collection
-            if self.roi_marker:
-                painter.setPen(QPen(QColor(255, 165, 0), 4))
-                # Draw circle
-                painter.drawEllipse(self.roi_marker, 32, 32)  # 64x64 ROI, so radius is 32
-                # Draw crosshair
-                painter.drawLine(self.roi_marker.x() - 40, self.roi_marker.y(),
-                               self.roi_marker.x() + 40, self.roi_marker.y())
-                painter.drawLine(self.roi_marker.x(), self.roi_marker.y() - 40,
-                               self.roi_marker.x(), self.roi_marker.y() + 40)
-                # Draw ROI boundary square
-                painter.drawRect(self.roi_marker.x() - 32, self.roi_marker.y() - 32, 64, 64)
             
             painter.end()
             
@@ -1646,11 +1415,6 @@ class MainWindow(QMainWindow):
         else:  # info
             self.recording_status_label.setStyleSheet("background-color: #CCFFCC; color: #006600; padding: 5px;")
     
-    def update_dataset_progress(self, current, total):
-        """Update dataset collection progress"""
-        self.dataset_progress_label.setText(f"Collecting depth images: {current}/{total}")
-        self.dataset_progress_label.show()
-    
     def show_error(self, error_message):
         """Show error message"""
         self.update_status(f"ERROR: {error_message}", "error")
@@ -1696,7 +1460,6 @@ class MainWindow(QMainWindow):
         """Start the stage calibration process"""
         self.calibration_mode = True
         self.reference_point_mode = False
-        self.depth_collection_mode = False
         self.calibration_point_index = -1
         self.current_calibration_point = None
         self.stage_thread.request_calibration()
@@ -1709,17 +1472,7 @@ class MainWindow(QMainWindow):
             
         self.reference_point_mode = True
         self.calibration_mode = False
-        self.depth_collection_mode = False
         self.update_status("Click on the image to set the reference point", "warning")
-    
-    def start_collect_z_dataset(self):
-        """Start Z depth dataset collection mode"""
-        self.depth_collection_mode = True
-        self.calibration_mode = False
-        self.reference_point_mode = False
-        self.update_status("Double-click on the ball position in the image to start Z-depth dataset collection", "warning")
-        # Disable the button during collection
-        self.collect_z_dataset_btn.setEnabled(False)
     
     def show_calibration_point(self, index, point):
         """Show a calibration point"""
@@ -1727,33 +1480,11 @@ class MainWindow(QMainWindow):
         self.calibration_point_index = index
         self.current_calibration_point = point
     
-    def show_roi_marker(self, center_point):
-        """Show ROI marker for depth dataset collection"""
-        self.roi_marker = center_point
-        # Set timer to clear ROI marker after 10 seconds (enough time for collection)
-        self.marker_timer.start(10000)
-    
     def on_calibration_complete(self, success):
         """Handle calibration completion"""
         self.calibration_mode = False
         if success:
             self.set_ref_point_btn.setEnabled(True)
-    
-    def on_dataset_collection_complete(self, success, message):
-        """Handle depth dataset collection completion"""
-        self.depth_collection_mode = False
-        self.dataset_progress_label.hide()
-        
-        # Re-enable the collect button
-        self.collect_z_dataset_btn.setEnabled(True)
-        
-        # Clear ROI marker
-        self.roi_marker = None
-        
-        if success:
-            self.update_status(f"Z-depth dataset collection completed: {message}", "info")
-        else:
-            self.update_status(f"Z-depth dataset collection failed: {message}", "error")
     
     # Arm control methods
     def check_arm_connection(self):
@@ -1822,21 +1553,15 @@ class MainWindow(QMainWindow):
     
     def image_double_click(self, event):
         """Handle mouse double-click events on the image"""
+        # If in calibration or reference point mode, ignore double-clicks
+        if self.calibration_mode or self.reference_point_mode:
+            return
+            
         pos = event.position()
         click_x = int(pos.x())
         click_y = int(pos.y())
         click_point = QPoint(click_x, click_y)
         
-        if self.depth_collection_mode:
-            # Start depth dataset collection
-            self.depth_dataset_thread.request_collect_dataset(click_x, click_y)
-            self.update_status(f"Starting Z-depth dataset collection at ({click_x}, {click_y})", "info")
-            return
-        
-        # If in calibration or reference point mode, ignore double-clicks
-        if self.calibration_mode or self.reference_point_mode:
-            return
-            
         # Check if stage is calibrated
         if not self.stage_thread.is_calibrated:
             self.update_status("Stage not calibrated. Please click 'Calibrate Stage' button first.", "warning")
@@ -1882,10 +1607,6 @@ class MainWindow(QMainWindow):
             self.current_calibration_point = None
             
         self.target_marker = None
-        
-        # Don't clear ROI marker automatically during dataset collection
-        if not self.depth_collection_mode:
-            self.roi_marker = None
     
     def closeEvent(self, event):
         """Clean up resources when closing the application"""
@@ -1899,7 +1620,6 @@ class MainWindow(QMainWindow):
         self.arm_thread.stop()
         self.pump_thread.stop()
         self.video_recording_thread.stop()
-        self.depth_dataset_thread.stop()
         
         # Wait for threads to finish
         self.camera_thread.wait()
@@ -1907,7 +1627,6 @@ class MainWindow(QMainWindow):
         self.arm_thread.wait()
         self.pump_thread.wait()
         self.video_recording_thread.wait()
-        self.depth_dataset_thread.wait()
         
         # Accept the close event
         event.accept()
