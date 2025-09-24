@@ -16,8 +16,6 @@ from stage import Stage
 from arm import armConnectState, armWorkingState, armGetMotorPos, armMovebyPos
 from pump_thread import LeftPumpThread
 
-from yolo_thread import YOLODetectionThread
-
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1145,10 +1143,6 @@ class MainWindow(QMainWindow):
         
         # Initialize threads
         self._setup_threads()
-
-        # YOLO detection state
-        self.yolo_detecting = False
-        self.detection_overlay = None  # Stores detection results for overlay
         
         # Calibration state
         self.calibration_mode = False
@@ -1217,7 +1211,6 @@ class MainWindow(QMainWindow):
         
         # Setup control groups
         self._setup_video_recording_group()
-        self._setup_detection_group()
         self._setup_stage_control_group()
         self._setup_arm_control_group()
         self._setup_pump_control_group()
@@ -1225,14 +1218,12 @@ class MainWindow(QMainWindow):
         # Add groups to control panel
         self.right_layout.addWidget(self.recording_group)
         self.right_layout.addSpacing(10)
-        self.right_layout.addWidget(self.detection_group)  # Add this line
-        self.right_layout.addSpacing(10)
         self.right_layout.addWidget(self.stage_group)
         self.right_layout.addSpacing(10)
         self.right_layout.addWidget(self.arm_group)
         self.right_layout.addSpacing(10)
         self.right_layout.addWidget(self.pump_group)
-        self.right_layout.addStretch(1)
+        self.right_layout.addStretch(1)  # Add stretch at the bottom
         
         # Connect mouse events for the image label
         self.image_label.mousePressEvent = self.image_click
@@ -1269,48 +1260,6 @@ class MainWindow(QMainWindow):
         self.recording_status_label.setStyleSheet("background-color: #F0F0F0; padding: 5px;")
         recording_layout.addWidget(self.recording_status_label)
     
-    def _setup_detection_group(self):
-        """Setup YOLO detection control group"""
-        self.detection_group = QGroupBox("YOLO Detection & Tracking")
-        detection_layout = QVBoxLayout()
-        self.detection_group.setLayout(detection_layout)
-        
-        # Detection toggle button
-        self.detect_track_btn = QPushButton("Start Detect & Track")
-        self.detect_track_btn.setFixedHeight(50)
-        self.detect_track_btn.setStyleSheet("background-color: #99CCFF; font-weight: bold; font-size: 14px;")
-        self.detect_track_btn.clicked.connect(self.toggle_detection)
-        detection_layout.addWidget(self.detect_track_btn)
-        
-        # FPS display
-        fps_layout = QHBoxLayout()
-        
-        self.detection_fps_label = QLabel("Detection FPS: --")
-        self.detection_fps_label.setStyleSheet("background-color: #F0F0F0; padding: 5px;")
-        fps_layout.addWidget(self.detection_fps_label)
-        
-        self.tracking_fps_label = QLabel("Tracking FPS: --")
-        self.tracking_fps_label.setStyleSheet("background-color: #F0F0F0; padding: 5px;")
-        fps_layout.addWidget(self.tracking_fps_label)
-        
-        detection_layout.addLayout(fps_layout)
-        
-        # Detection status
-        self.detection_status_label = QLabel("Detection: OFF")
-        self.detection_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.detection_status_label.setStyleSheet("background-color: #FFE6E6; color: #CC0000; padding: 5px;")
-        detection_layout.addWidget(self.detection_status_label)
-        
-        # Frame skip control
-        skip_layout = QFormLayout()
-        self.frame_skip_spin = QSpinBox()
-        self.frame_skip_spin.setRange(0, 10)
-        self.frame_skip_spin.setValue(0)
-        self.frame_skip_spin.setToolTip("0 = process every frame, 1 = skip 1 frame, etc.")
-        self.frame_skip_spin.valueChanged.connect(self.update_frame_skip)
-        skip_layout.addRow("Frame Skip:", self.frame_skip_spin)
-        detection_layout.addLayout(skip_layout)
-
     def _setup_stage_control_group(self):
         """Setup stage control group"""
         self.stage_group = QGroupBox("Stage Control")
@@ -1489,19 +1438,12 @@ class MainWindow(QMainWindow):
         self.pump_thread = PumpControlThread()
         self.video_recording_thread = VideoRecordingThread()
         self.depth_dataset_thread = DepthDatasetThread()
-        # Create YOLO detection thread
-        self.yolo_thread = YOLODetectionThread()
         
         # Connect camera signals
         self.camera_thread.new_image_signal.connect(self.update_display)
         self.camera_thread.new_image_signal.connect(self.video_recording_thread.update_frame)
         self.camera_thread.new_image_signal.connect(self.update_current_image)
         self.camera_thread.error_signal.connect(self.show_error)
-
-        # Connect YOLO signals
-        self.yolo_thread.detection_result_signal.connect(self.update_detection_overlay)
-        self.yolo_thread.status_signal.connect(self.update_detection_status)
-        self.yolo_thread.fps_signal.connect(self.update_fps_display)
         
         # Connect stage signals
         self.stage_thread.status_signal.connect(self.update_status)
@@ -1536,14 +1478,10 @@ class MainWindow(QMainWindow):
         self.pump_thread.start()
         self.video_recording_thread.start()
         self.depth_dataset_thread.start()
-        self.yolo_thread.start()
     
     def update_current_image(self, image):
         """Update current image for depth dataset thread"""
         self.current_image = image.copy() if image is not None else None
-        # Update YOLO thread with new frame if detecting
-        if self.yolo_detecting and self.yolo_thread:
-            self.yolo_thread.update_frame(image)
         if self.depth_dataset_thread:
             self.depth_dataset_thread.set_current_image(self.current_image)
     
@@ -1611,51 +1549,6 @@ class MainWindow(QMainWindow):
                 painter.drawLine(self.target_marker.x(), self.target_marker.y() - 15,
                                self.target_marker.x(), self.target_marker.y() + 15)
             
-            # Draw detection overlay if available
-            if self.detection_overlay is not None and self.yolo_detecting:
-                boxes, scores, class_ids, tracks = self.detection_overlay
-                
-                # Draw bounding boxes
-                for box, score, class_id in zip(boxes, scores, class_ids):
-                    x1, y1, x2, y2 = box.astype(int)
-                    
-                    # Get class color
-                    base_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
-                    color = base_colors[int(class_id) % len(base_colors)]
-                    
-                    # Draw box
-                    painter.setPen(QPen(QColor(*color), 2))
-                    painter.drawRect(x1, y1, x2 - x1, y2 - y1)
-                    
-                    # Draw label
-                    label = f"{self.yolo_thread.class_names[int(class_id)]}: {score:.2f}"
-                    font = QFont()
-                    font.setPointSize(10)
-                    painter.setFont(font)
-                    
-                    # Draw background for text
-                    text_rect = painter.fontMetrics().boundingRect(label)
-                    painter.fillRect(x1, y1 - text_rect.height() - 2, text_rect.width() + 4, text_rect.height() + 2, QColor(*color))
-                    painter.setPen(QColor(255, 255, 255))
-                    painter.drawText(x1 + 2, y1 - 2, label)
-                
-                # Draw tracks
-                for track_id, track_data in tracks.items():
-                    trajectory = track_data['trajectory']
-                    color = track_data['color']
-                    
-                    if len(trajectory) >= 2:
-                        painter.setPen(QPen(QColor(*color), 2))
-                        for i in range(1, len(trajectory)):
-                            pt1 = trajectory[i-1]
-                            pt2 = trajectory[i]
-                            painter.drawLine(int(pt1[0]), int(pt1[1]), int(pt2[0]), int(pt2[1]))
-                        
-                        # Draw track ID
-                        last_pt = trajectory[-1]
-                        painter.setPen(QColor(*color))
-                        painter.drawText(int(last_pt[0]), int(last_pt[1]) - 10, f"ID:{track_id}")
-
             # Draw ROI marker (orange) for depth dataset collection
             if self.roi_marker:
                 painter.setPen(QPen(QColor(255, 165, 0), 4))
@@ -1980,56 +1873,6 @@ class MainWindow(QMainWindow):
         
         event.accept()
     
-    def toggle_detection(self):
-        """Toggle YOLO detection and tracking"""
-        if not self.yolo_detecting:
-            # Start detection
-            self.yolo_detecting = True
-            self.yolo_thread.start_detection()
-            self.detect_track_btn.setText("Stop Detect & Track")
-            self.detect_track_btn.setStyleSheet("background-color: #FF9999; font-weight: bold; font-size: 14px;")
-            self.detection_status_label.setText("Detection: ON")
-            self.detection_status_label.setStyleSheet("background-color: #E6FFE6; color: #006600; padding: 5px;")
-        else:
-            # Stop detection
-            self.yolo_detecting = False
-            self.yolo_thread.stop_detection()
-            self.detect_track_btn.setText("Start Detect & Track")
-            self.detect_track_btn.setStyleSheet("background-color: #99CCFF; font-weight: bold; font-size: 14px;")
-            self.detection_status_label.setText("Detection: OFF")
-            self.detection_status_label.setStyleSheet("background-color: #FFE6E6; color: #CC0000; padding: 5px;")
-            self.detection_overlay = None
-            
-            # Clear FPS display
-            self.detection_fps_label.setText("Detection FPS: --")
-            self.tracking_fps_label.setText("Tracking FPS: --")
-    
-    def update_detection_overlay(self, frame, boxes, scores, class_ids, tracks):
-        """Update detection overlay data"""
-        self.detection_overlay = (boxes, scores, class_ids, tracks)
-    
-    def update_detection_status(self, message, msg_type):
-        """Update detection status message"""
-        if msg_type == "error":
-            logger.error(f"YOLO: {message}")
-            # Show error in main status if critical
-            if "initialization failed" in message.lower():
-                self.update_status(f"YOLO Error: {message}", "error")
-        elif msg_type == "warning":
-            logger.warning(f"YOLO: {message}")
-        else:
-            logger.info(f"YOLO: {message}")
-    
-    def update_fps_display(self, detection_fps, tracking_fps):
-        """Update FPS display"""
-        self.detection_fps_label.setText(f"Detection FPS: {detection_fps:.1f}")
-        self.tracking_fps_label.setText(f"Tracking FPS: {tracking_fps:.1f}")
-    
-    def update_frame_skip(self, value):
-        """Update frame skip setting"""
-        if self.yolo_thread:
-            self.yolo_thread.set_skip_frames(value)
-
     def clear_markers(self):
         """Clear visual markers after timer expires"""
         if self.marker_timer.isActive():
@@ -2057,10 +1900,6 @@ class MainWindow(QMainWindow):
         self.pump_thread.stop()
         self.video_recording_thread.stop()
         self.depth_dataset_thread.stop()
-        # Stop YOLO thread
-        if self.yolo_detecting:
-            self.toggle_detection()
-        self.yolo_thread.stop()
         
         # Wait for threads to finish
         self.camera_thread.wait()
@@ -2069,7 +1908,6 @@ class MainWindow(QMainWindow):
         self.pump_thread.wait()
         self.video_recording_thread.wait()
         self.depth_dataset_thread.wait()
-        self.yolo_thread.wait()
         
         # Accept the close event
         event.accept()
